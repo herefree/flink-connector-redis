@@ -18,9 +18,6 @@
 
 package org.apache.flink.streaming.connectors.redis.table;
 
-import io.lettuce.core.Range;
-import io.lettuce.core.RedisFuture;
-
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
@@ -43,12 +40,17 @@ import org.apache.flink.util.Preconditions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.lettuce.core.Range;
+import io.lettuce.core.RedisFuture;
+
 import java.io.IOException;
 import java.time.LocalTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletionStage;
+import java.util.stream.Collectors;
 
 /**
  * @param <IN>
@@ -59,24 +61,26 @@ public class RedisSinkFunction<IN> extends RichSinkFunction<IN> {
 
     private static final Logger LOG = LoggerFactory.getLogger(RedisSinkFunction.class);
     private final int maxRetryTimes;
-    private final boolean setIfAbsent;
-    private final boolean ttlKeyNotAbsent;
-    private final RedisSinkMapper<IN> redisSinkMapper;
-    private final RedisCommand redisCommand;
-    private final FlinkConfigBase flinkConfigBase;
-    private final List<DataType> columnDataTypes;
-    private final RedisValueDataStructure redisValueDataStructure;
-    private final String zremrangeby;
     protected Integer ttl;
     protected int expireTimeSeconds = -1;
+    private boolean setIfAbsent;
+    private boolean ttlKeyNotAbsent;
+    private RedisSinkMapper<IN> redisSinkMapper;
+    private RedisCommand redisCommand;
+    private FlinkConfigBase flinkConfigBase;
     private transient RedisCommandsContainer redisCommandsContainer;
+    private List<DataType> columnDataTypes;
+    private RedisValueDataStructure redisValueDataStructure;
+
+    private String zremrangeby;
+    private List<String> columns;
 
     /**
      * Creates a new {@link RedisSinkFunction} that connects to the Redis server.
      *
      * @param flinkConfigBase The configuration of {@link FlinkConfigBase}
      * @param redisSinkMapper This is used to generate Redis command and key value from incoming
-     *     elements.
+     *                        elements.
      */
     public RedisSinkFunction(
             FlinkConfigBase flinkConfigBase,
@@ -103,13 +107,14 @@ public class RedisSinkFunction<IN> extends RichSinkFunction<IN> {
         }
 
         this.columnDataTypes = resolvedSchema.getColumnDataTypes();
+        this.columns = resolvedSchema.getColumns().stream().map(x -> x.getName()).collect(Collectors.toList());
         this.redisValueDataStructure = readableConfig.get(RedisOptions.VALUE_DATA_STRUCTURE);
         this.zremrangeby = readableConfig.get(RedisOptions.ZREM_RANGEBY);
     }
 
     /**
      * Called when new data arrives to the sink, and forwards it to Redis channel. Depending on the
-     * specified Redis data type, a different Redis command will be
+     * specified Redis data type , a different Redis command will be
      * applied. Available commands are RPUSH, LPUSH, SADD, PUBLISH, SET, SETEX, PFADD, HSET, ZADD.
      *
      * @param input The incoming data
@@ -134,7 +139,23 @@ public class RedisSinkFunction<IN> extends RichSinkFunction<IN> {
             params[params.length - 1] = serializeWholeRow(rowData);
         }
 
-        startSink(params, kind);
+        if (redisCommand.getInsertCommand() == RedisInsertCommand.HMSET) {
+            int size = (params.length - 1) * 2 + 1;
+            String[] newParams = new String[size];
+            newParams[0] = params[0];
+            for (int i = 1; i < params.length; i++) {
+                // 1 - 1,2
+                // 2 - 3,4
+                // 3 - 5,6
+                // 4 - 7,8
+                int j = (i - 1) * 2 + 1;
+                newParams[j] = columns.get(i);
+                newParams[j + 1] = params[i];
+            }
+            startSink(newParams, kind);
+        } else {
+            startSink(params, kind);
+        }
     }
 
     /**
@@ -153,10 +174,13 @@ public class RedisSinkFunction<IN> extends RichSinkFunction<IN> {
                     redisFuture = sink(params);
                 }
 
+                CompletionStage completionStage = null;
                 if (redisFuture != null) {
-                    redisFuture.whenComplete((r, t) -> setTtl(params[0]));
+                    completionStage = redisFuture.whenComplete((r, t) -> setTtl(params[0]));
                 }
-
+                if (completionStage != null) {
+                    completionStage.toCompletableFuture().join();
+                }
                 break;
             } catch (UnsupportedOperationException e) {
                 throw e;
@@ -165,7 +189,7 @@ public class RedisSinkFunction<IN> extends RichSinkFunction<IN> {
                 if (i >= this.maxRetryTimes) {
                     throw new RuntimeException("sink redis error ", e1);
                 }
-                Thread.sleep(500L * i);
+                Thread.sleep(500 * i);
             }
         }
     }
@@ -200,7 +224,7 @@ public class RedisSinkFunction<IN> extends RichSinkFunction<IN> {
                             });
                 }
             }
-                break;
+            break;
             case PFADD:
                 redisFuture = this.redisCommandsContainer.pfadd(params[0], params[1]);
                 break;
@@ -266,7 +290,7 @@ public class RedisSinkFunction<IN> extends RichSinkFunction<IN> {
                             });
                 }
             }
-                break;
+            break;
             case HMSET: {
                 if (params.length < 2) {
                     throw new RuntimeException("params length must be greater than 2");
@@ -279,6 +303,7 @@ public class RedisSinkFunction<IN> extends RichSinkFunction<IN> {
                 for (int i = 1; i < params.length; i++) {
                     hashField.put(params[i], params[++i]);
                 }
+                LOG.info("the hmset field is {} {}", params[0], hashField);
                 if (!this.setIfAbsent) {
                     redisFuture = this.redisCommandsContainer.hmset(params[0], hashField);
                 } else {
@@ -291,7 +316,7 @@ public class RedisSinkFunction<IN> extends RichSinkFunction<IN> {
                             });
                 }
             }
-                break;
+            break;
             case HINCRBY:
                 redisFuture =
                         this.redisCommandsContainer.hincrBy(
@@ -352,7 +377,7 @@ public class RedisSinkFunction<IN> extends RichSinkFunction<IN> {
             case HDEL: {
                 redisFuture = this.redisCommandsContainer.hdel(params[0], params[1]);
             }
-                break;
+            break;
             case HINCRBY:
                 redisFuture =
                         this.redisCommandsContainer.hincrBy(
@@ -385,7 +410,6 @@ public class RedisSinkFunction<IN> extends RichSinkFunction<IN> {
         if (redisCommand == RedisCommand.DEL) {
             return;
         }
-
         if (ttl != null) {
             if (ttlKeyNotAbsent) {
                 // set ttl when key not absent
@@ -399,6 +423,7 @@ public class RedisSinkFunction<IN> extends RichSinkFunction<IN> {
                                 });
             } else {
                 // set ttl every sink
+                LOG.info("set ttl key {}, ttl {}", key, ttl);
                 this.redisCommandsContainer.expire(key, ttl);
             }
         } else if (expireTimeSeconds != -1) {
@@ -415,8 +440,6 @@ public class RedisSinkFunction<IN> extends RichSinkFunction<IN> {
                                                     : 86400 + expireTimeSeconds - now);
                                 }
                             });
-        } else if (ttl != null) {
-            this.redisCommandsContainer.expire(key, ttl);
         }
     }
 

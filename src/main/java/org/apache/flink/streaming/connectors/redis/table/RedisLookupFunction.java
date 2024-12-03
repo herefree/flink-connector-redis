@@ -104,6 +104,7 @@ public class RedisLookupFunction extends AsyncTableFunction<RowData> {
             GenericRowData genericRowData = null;
             switch (redisCommand.getJoinCommand()) {
                 case GET:
+                case HMGET:
                     genericRowData = (GenericRowData) cache.getIfPresent(String.valueOf(keys[0]));
                     break;
                 case HGET:

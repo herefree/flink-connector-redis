@@ -24,6 +24,7 @@ import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.types.DataType;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.apache.flink.streaming.connectors.redis.table.RedisDynamicTableFactory.CACHE_SEPERATOR;
 
@@ -135,6 +136,24 @@ public class RedisResultWrapper {
             return genericRowData;
         }
         genericRowData.setField(1, value);
+        return genericRowData;
+    }
+
+    public static GenericRowData createRowDataForMHash(
+            Object[] keys,
+            Map<String, String> map,
+            List<DataType> dataTypes,
+            List<String> columns) {
+        int size = dataTypes.size();
+        GenericRowData genericRowData = new GenericRowData(size);
+        genericRowData.setField(0, RedisRowConverter.dataTypeFromString(
+                dataTypes.get(0).getLogicalType(), String.valueOf(keys[0])));
+        for (int i = 1; i < size; i++) {
+            String key = columns.get(i);
+            String value = map.get(key);
+            genericRowData.setField(i, RedisRowConverter.dataTypeFromString(
+                    dataTypes.get(i).getLogicalType(), value));
+        }
         return genericRowData;
     }
 }

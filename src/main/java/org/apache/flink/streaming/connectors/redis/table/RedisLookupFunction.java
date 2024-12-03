@@ -69,6 +69,8 @@ public class RedisLookupFunction extends AsyncTableFunction<RowData> {
     private final RedisValueDataStructure redisValueDataStructure;
     private Cache<String, Object> cache;
 
+    private List<String> columns;
+
     public RedisLookupFunction(
             FlinkConfigBase flinkConfigBase,
             RedisMapper redisMapper,
@@ -90,7 +92,7 @@ public class RedisLookupFunction extends AsyncTableFunction<RowData> {
         Preconditions.checkNotNull(
                 redisCommandDescription, "Redis Mapper data type description can not be null");
         this.redisCommand = redisCommandDescription.getRedisCommand();
-
+        this.columns = resolvedSchema.getColumnNames();
         this.dataTypes = resolvedSchema.getColumnDataTypes();
     }
 
@@ -217,6 +219,23 @@ public class RedisLookupFunction extends AsyncTableFunction<RowData> {
 
                 break;
             }
+            case HMGET:
+                this.redisCommandsContainer
+                        .hgetAll(String.valueOf(keys[0]))
+                        .thenAccept(
+                                map -> {
+                                    GenericRowData rowData =
+                                            RedisResultWrapper.createRowDataForMHash(
+                                                    keys,
+                                                    map,
+                                                    dataTypes,
+                                                    columns);
+                                    resultFuture.complete(Collections.singleton(rowData));
+                                    if (cache != null && map != null) {
+                                        cache.put(String.valueOf(keys[0]), rowData);
+                                    }
+                                });
+                break;
             case ZSCORE: {
                 this.redisCommandsContainer
                         .zscore(String.valueOf(keys[0]), String.valueOf(keys[1]))
